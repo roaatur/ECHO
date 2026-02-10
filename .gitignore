@@ -3,3 +3,5 @@ VisDrone*/
 *.engine
 UAVDET-NEW/
 ~lock.*
+lightning_logs/
+events.out.tfevents.*
