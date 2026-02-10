@@ -2,3 +2,4 @@ VisDrone*/
 *.pt
 *.engine
 UAVDET-NEW/
+~lock.*
