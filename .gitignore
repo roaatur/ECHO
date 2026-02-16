@@ -5,3 +5,4 @@ UAVDET-NEW/
 ~lock.*
 lightning_logs/
 events.out.tfevents.*
+UAVDET-NEW*/
