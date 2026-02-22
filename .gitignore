@@ -8,3 +8,6 @@ events.out.tfevents.*
 UAVDET-NEW*/
 *.compare.jpg
 *_compare.jpg
+*.ckpt
+.~lock.*
+yolo_runs_on_uavdt/
