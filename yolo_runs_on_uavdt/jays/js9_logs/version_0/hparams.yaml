@@ -1,0 +1,6 @@
+coeff: 0.1
+hidden_size: 64
+horizon: 10
+input_size: 24
+lambda_density: 0.0
+lr: 0.001

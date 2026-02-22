@@ -10,4 +10,14 @@ UAVDET-NEW*/
 *_compare.jpg
 *.ckpt
 .~lock.*
-yolo_runs_on_uavdt/
+
+# Intermediate/regenerable data (keep local)
+__pycache__/
+res_experiment/models_dependent_*
+res_experiment/res_discovery_features.csv
+res_experiment/res_lstm_logs/
+res_experiment/res_lstm_*.pkl
+res_experiment/2lstms/*_data.csv
+res_experiment/2lstms/*.pkl
+lstm/lstm_old.py
+lstm/crafted_dataset.csv
