@@ -6,3 +6,5 @@ UAVDET-NEW/
 lightning_logs/
 events.out.tfevents.*
 UAVDET-NEW*/
+*.compare.jpg
+*_compare.jpg
