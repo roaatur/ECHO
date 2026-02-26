@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Evidential LSTM trained on 15 spatial features to predict miss count (fn).
+"""Evidential LSTM — per-sequence normalized, horizon=3.
 
-Architecture identical to Chapter 4 / 2lstms experiments.
-Input: 15 spatial features × 20-frame context → 10-frame fn horizon + 1-step num_gt.
-Target: fn (miss count per frame from nano@320).
+Per-sequence normalization: subtract sequence mean from features AND target,
+forcing the model to learn intra-sequence variation (frame-level dynamics)
+rather than inter-sequence levels (sequence difficulty).
+
+Input: 15 spatial features × 20-frame context → 3-frame fn horizon + 1-step num_gt.
+Target: fn (miss count per frame from nano@320), per-sequence normalized.
 
 Output: spatial_experiments_lstm_results.pdf (4 pages)
 """
@@ -36,12 +39,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_CSV         = SCRIPT_DIR / "spatial_experiments_all_features.csv"
 SCALER_PATH      = SCRIPT_DIR / "spatial_experiments_lstm_scaler.pkl"
 DENSITY_MAX_PATH = SCRIPT_DIR / "spatial_experiments_lstm_density_max.pkl"
+SEQ_MEANS_PATH   = SCRIPT_DIR / "spatial_experiments_lstm_seq_means.pkl"
 CKPT_DIR         = SCRIPT_DIR
 LOG_DIR          = SCRIPT_DIR / "spatial_experiments_lstm_logs"
 PDF_PATH         = SCRIPT_DIR / "spatial_experiments_lstm_results.pdf"
 
 T_CONTEXT = 20
-T_HORIZON = 10
+T_HORIZON = 3
 TARGET_COL = "fn"
 
 # 15 spatial features (selected by spatial_experiments_feature_selection.py)
@@ -83,6 +87,7 @@ PREV_RESULTS = {
     "LSTM_nano (23 feat)":     {"target": "recall_gap", "r2": -0.017, "mae": 0.137, "rho": 0.357},
     "LSTM_medium (23 feat)":   {"target": "recall_gap", "r2": -0.098, "mae": 0.144, "rho": 0.215},
     "Nano recall (23 feat)":   {"target": "nano_recall", "r2": -0.021, "mae": 0.191, "rho": 0.265},
+    "Spatial global (15 feat)": {"target": "fn", "r2": 0.553, "mae": 1.75, "rho": 0.731},
 }
 
 
@@ -114,7 +119,7 @@ def EvidentialLoss(y_true, gamma, v, alpha, beta, coeff=1.0):
 
 # ── Model ──────────────────────────────────────────────────────────
 class MultiTaskLSTM(L.LightningModule):
-    """Evidential LSTM: fn prediction (10-step) + num_gt auxiliary (1-step)."""
+    """Evidential LSTM: fn prediction (3-step) + num_gt auxiliary (1-step)."""
 
     def __init__(self, input_size=15, hidden_size=64, horizon=10, lr=1e-3,
                  coeff=0.1, lambda_density=0.1):
@@ -131,7 +136,7 @@ class MultiTaskLSTM(L.LightningModule):
         hidden = h_n.squeeze(0)
 
         fn_out = self.head_fn(hidden).view(-1, self.hparams.horizon, 4)
-        gamma = F.softplus(fn_out[..., 0])     # fn ≥ 0
+        gamma = fn_out[..., 0]                   # normalized fn (can be negative)
         v = F.softplus(fn_out[..., 1])
         alpha = F.softplus(fn_out[..., 2]) + 1
         beta = F.softplus(fn_out[..., 3])
@@ -209,9 +214,9 @@ def create_dataset():
     # Exclude degenerate sequences
     df = df[~df["sequence"].isin(EXCLUDE_SEQUENCES)].reset_index(drop=True)
 
-    # Forward-smooth fn target (10-frame lookahead)
+    # Forward-smooth fn target (3-frame lookahead, matches T_HORIZON)
     df[TARGET_COL] = df.groupby("sequence")[TARGET_COL].transform(
-        lambda s: _forward_smooth(s, window=10)
+        lambda s: _forward_smooth(s, window=T_HORIZON)
     )
 
     df = df[df["num_gt"] >= 1]
@@ -219,6 +224,26 @@ def create_dataset():
 
     print(f"After filtering: {len(df)} rows, {df['sequence'].nunique()} sequences")
     return df
+
+
+def per_sequence_normalize(df, feature_cols, target_col):
+    """Subtract per-sequence mean from features and target.
+
+    Forces the model to learn intra-sequence variation (relative changes)
+    rather than inter-sequence levels (absolute difficulty).
+    Returns: (normalized_df, seq_means_dict)
+    """
+    seq_means = {}
+    for seq_name, sdf in df.groupby("sequence"):
+        means = {col: float(sdf[col].mean()) for col in feature_cols + [target_col]}
+        seq_means[seq_name] = means
+
+    df = df.copy()
+    for seq_name, sdf_idx in df.groupby("sequence").groups.items():
+        for col in feature_cols + [target_col]:
+            df.loc[sdf_idx, col] -= seq_means[seq_name][col]
+
+    return df, seq_means
 
 
 def build_sliding_windows(df, feature_cols, target_col, density_col="num_gt"):
@@ -280,6 +305,12 @@ def main():
     print(f"Scaler saved -> {SCALER_PATH}")
 
     df[FEATURES] = scaler.transform(df[FEATURES])
+
+    # ── Per-sequence normalization: remove sequence-level signal ──
+    df, seq_means = per_sequence_normalize(df, FEATURES, TARGET_COL)
+    with open(SEQ_MEANS_PATH, "wb") as f:
+        pickle.dump(seq_means, f)
+    print(f"Seq means saved -> {SEQ_MEANS_PATH}  ({len(seq_means)} sequences)")
 
     # ── Normalize num_gt (fit on train only) ──
     density_max = float(train_df["num_gt"].max())
@@ -368,7 +399,9 @@ def main():
     print("QUANTITATIVE EVALUATION")
     print("=" * 70)
 
-    all_fn_metrics = {}
+    # Metrics: "norm" = per-sequence normalized (intra-seq), "raw" = denormalized
+    all_fn_metrics_norm = {}   # normalized (what model sees)
+    all_fn_metrics_raw = {}    # denormalized (for comparison with previous 0.553)
     all_den_metrics = {}
     val_seq_data = {}
 
@@ -378,27 +411,36 @@ def main():
             continue
 
         X_seq = torch.from_numpy(X_val[indices]).to(device)
-        y_fn_seq = y_fn_val[indices]
+        y_fn_seq = y_fn_val[indices]           # normalized
         y_den_seq = y_den_val[indices]
 
         with torch.no_grad():
             gamma, v, alpha, beta, density = model(X_seq)
-            fn_preds = gamma.cpu().numpy()
+            fn_preds = gamma.cpu().numpy()     # normalized predictions
             den_preds_norm = density.cpu().numpy()
             aleatoric, epistemic = model.get_uncertainty(v, alpha, beta)
             epistemic = epistemic.cpu().numpy()
 
         den_preds = den_preds_norm * density_max
 
+        # Denormalize fn for raw metrics
+        fn_mean = seq_means[seq_name][TARGET_COL]
+        fn_preds_raw = fn_preds + fn_mean
+        y_fn_raw = y_fn_seq + fn_mean
+
         weather = seq_weather.get(seq_name, "unknown")
         print(f"\n  --- {seq_name} ({weather}) ---")
-        fn_m = compute_metrics(y_fn_seq.flatten(), fn_preds.flatten(),
-                               label=f"{seq_name} fn (miss count)")
+        fn_m_norm = compute_metrics(y_fn_seq.flatten(), fn_preds.flatten(),
+                                    label=f"{seq_name} fn normalized (intra-seq)")
+        fn_m_raw = compute_metrics(y_fn_raw.flatten(), fn_preds_raw.flatten(),
+                                   label=f"{seq_name} fn raw (denorm)")
         den_m = compute_metrics(y_den_seq.flatten(), den_preds.flatten(),
                                 label=f"{seq_name} num_gt")
-        all_fn_metrics[seq_name] = fn_m
+        all_fn_metrics_norm[seq_name] = fn_m_norm
+        all_fn_metrics_raw[seq_name] = fn_m_raw
         all_den_metrics[seq_name] = den_m
 
+        # Build frame-level data for plotting (use RAW values for interpretability)
         fn_pred_at = defaultdict(list)
         fn_epis_at = defaultdict(list)
         fn_true_at = {}
@@ -409,9 +451,9 @@ def main():
             window_start = idx - indices[0]
             for h in range(T_HORIZON):
                 frame = window_start + T_CONTEXT + h
-                fn_pred_at[frame].append(fn_preds[w, h])
+                fn_pred_at[frame].append(fn_preds_raw[w, h])
                 fn_epis_at[frame].append(epistemic[w, h])
-                fn_true_at[frame] = y_fn_seq[w, h]
+                fn_true_at[frame] = y_fn_raw[w, h]
 
             den_frame = window_start + T_CONTEXT
             den_pred_at[den_frame].append(den_preds[w])
@@ -429,9 +471,10 @@ def main():
             "den_pred": np.array([np.mean(den_pred_at[f]) for f in frames_den]),
         }
 
-    # Overall val metrics
+    # Overall val metrics (both normalized and raw)
     print("\n" + "-" * 70)
-    all_fn_true, all_fn_pred = [], []
+    all_fn_true_norm, all_fn_pred_norm = [], []
+    all_fn_true_raw, all_fn_pred_raw = [], []
     all_den_true, all_den_pred = [], []
     for seq_name in VAL_SEQUENCES:
         indices = [i for i, (s, _) in enumerate(val_ids) if s == seq_name]
@@ -440,31 +483,43 @@ def main():
         X_seq = torch.from_numpy(X_val[indices]).to(device)
         with torch.no_grad():
             gamma, _, _, _, density = model(X_seq)
-        all_fn_true.append(y_fn_val[indices].flatten())
-        all_fn_pred.append(gamma.cpu().numpy().flatten())
+        fn_mean = seq_means[seq_name][TARGET_COL]
+        all_fn_true_norm.append(y_fn_val[indices].flatten())
+        all_fn_pred_norm.append(gamma.cpu().numpy().flatten())
+        all_fn_true_raw.append(y_fn_val[indices].flatten() + fn_mean)
+        all_fn_pred_raw.append(gamma.cpu().numpy().flatten() + fn_mean)
         all_den_true.append(y_den_val[indices].flatten())
         all_den_pred.append((density.cpu().numpy() * density_max).flatten())
 
-    all_fn_true = np.concatenate(all_fn_true)
-    all_fn_pred = np.concatenate(all_fn_pred)
+    all_fn_true_norm = np.concatenate(all_fn_true_norm)
+    all_fn_pred_norm = np.concatenate(all_fn_pred_norm)
+    all_fn_true_raw = np.concatenate(all_fn_true_raw)
+    all_fn_pred_raw = np.concatenate(all_fn_pred_raw)
     all_den_true = np.concatenate(all_den_true)
     all_den_pred = np.concatenate(all_den_pred)
 
-    overall_fn = compute_metrics(all_fn_true, all_fn_pred, label="OVERALL fn (miss count)")
+    overall_fn_norm = compute_metrics(all_fn_true_norm, all_fn_pred_norm,
+                                      label="OVERALL fn NORMALIZED (intra-seq)")
+    overall_fn_raw = compute_metrics(all_fn_true_raw, all_fn_pred_raw,
+                                     label="OVERALL fn RAW (denormalized)")
     overall_den = compute_metrics(all_den_true, all_den_pred, label="OVERALL num_gt")
-    all_fn_metrics["OVERALL"] = overall_fn
+    all_fn_metrics_norm["OVERALL"] = overall_fn_norm
+    all_fn_metrics_raw["OVERALL"] = overall_fn_raw
     all_den_metrics["OVERALL"] = overall_den
 
-    baseline_fn_pred = np.full_like(all_fn_true, all_fn_true.mean())
+    baseline_fn_pred_norm = np.full_like(all_fn_true_norm, all_fn_true_norm.mean())
+    baseline_fn_pred_raw = np.full_like(all_fn_true_raw, all_fn_true_raw.mean())
     baseline_den_pred = np.full_like(all_den_true, all_den_true.mean())
-    baseline_fn = compute_metrics(all_fn_true, baseline_fn_pred,
-                                  label="BASELINE fn (mean)")
+    baseline_fn_norm = compute_metrics(all_fn_true_norm, baseline_fn_pred_norm,
+                                       label="BASELINE fn normalized (mean)")
+    baseline_fn_raw = compute_metrics(all_fn_true_raw, baseline_fn_pred_raw,
+                                      label="BASELINE fn raw (mean)")
     baseline_den = compute_metrics(all_den_true, baseline_den_pred,
                                    label="BASELINE num_gt (mean)")
 
-    # Per-weather R2
+    # Per-weather R2 (normalized = intra-seq)
     print("\n" + "=" * 70)
-    print("PER-WEATHER FN R2")
+    print("PER-WEATHER FN R2 (normalized = intra-sequence)")
     print("=" * 70)
     weather_r2 = {}
     for weather_cat in ["sunny", "cloudy", "night", "rainy"]:
@@ -490,10 +545,12 @@ def main():
             print(f"  {weather_cat:8s}  R2={w_r2:.4f}  MAE={w_mae:.4f}  "
                   f"rho={w_rho:.4f}  n={len(wt)}")
 
-    print(f"\n  OVERALL fn R2  = {overall_fn['r2']:.4f}")
-    print(f"  OVERALL fn MAE = {overall_fn['mae']:.4f}")
-    print(f"  OVERALL fn rho = {overall_fn['rho']:.4f}")
-    print(f"  Baseline MAE   = {baseline_fn['mae']:.4f}")
+    print(f"\n  OVERALL fn R2  (normalized) = {overall_fn_norm['r2']:.4f}")
+    print(f"  OVERALL fn R2  (raw/denorm) = {overall_fn_raw['r2']:.4f}")
+    print(f"  OVERALL fn MAE (normalized) = {overall_fn_norm['mae']:.4f}")
+    print(f"  OVERALL fn rho (normalized) = {overall_fn_norm['rho']:.4f}")
+    print(f"  Baseline MAE   (normalized) = {baseline_fn_norm['mae']:.4f}")
+    print(f"  Previous global R2 = 0.553  (inter-sequence, for reference)")
 
     # ── PDF ────────────────────────────────────────────────────────
     with PdfPages(str(PDF_PATH)) as pdf:
@@ -508,7 +565,8 @@ def main():
         for row, seq_name in enumerate(plot_seqs):
             d = val_seq_data[seq_name]
             weather = seq_weather.get(seq_name, "unknown")
-            fm = all_fn_metrics[seq_name]
+            fm_norm = all_fn_metrics_norm[seq_name]
+            fm_raw = all_fn_metrics_raw[seq_name]
             dm = all_den_metrics[seq_name]
 
             ax = axes[row, 0]
@@ -524,7 +582,7 @@ def main():
             )
             ax.set_ylabel("Miss Count (fn)")
             ax.set_title(f"{seq_name} [{weather}] fn "
-                         f"(MAE={fm['mae']:.3f}, R2={fm['r2']:.3f})")
+                         f"(norm R2={fm_norm['r2']:.3f}, raw R2={fm_raw['r2']:.3f})")
             ax.legend(fontsize=7, loc="upper right")
 
             ax = axes[row, 1]
@@ -541,7 +599,7 @@ def main():
                 axes[row, 0].set_xlabel("Frame index (local)")
                 axes[row, 1].set_xlabel("Frame index (local)")
 
-        fig.suptitle("Spatial LSTM (15 features) -- Miss Count Prediction "
+        fig.suptitle("Spatial LSTM (per-seq norm, horizon=3) -- Miss Count "
                      "-- Top 2 Sequences per Weather",
                      fontsize=13, fontweight="bold")
         plt.tight_layout(rect=[0, 0, 1, 0.97])
@@ -579,39 +637,40 @@ def main():
             axes[0, 0].text(0.5, 0.5, "No log CSV found", ha="center")
 
         ax = axes[0, 1]
-        ax.scatter(all_fn_true, all_fn_pred, alpha=0.1, s=4)
-        lims = [min(all_fn_true.min(), all_fn_pred.min()),
-                max(all_fn_true.max(), all_fn_pred.max())]
+        ax.scatter(all_fn_true_norm, all_fn_pred_norm, alpha=0.1, s=4)
+        lims = [min(all_fn_true_norm.min(), all_fn_pred_norm.min()),
+                max(all_fn_true_norm.max(), all_fn_pred_norm.max())]
         ax.plot(lims, lims, "k--", lw=0.5)
-        ax.set_xlabel("Actual fn (miss count)")
-        ax.set_ylabel("Predicted fn")
-        ax.set_title(f"Miss Count (R2={overall_fn['r2']:.3f})")
+        ax.set_xlabel("Actual fn (normalized)")
+        ax.set_ylabel("Predicted fn (normalized)")
+        ax.set_title(f"fn Normalized / Intra-seq (R2={overall_fn_norm['r2']:.3f})")
 
         ax = axes[1, 0]
-        ax.scatter(all_den_true, all_den_pred, alpha=0.1, s=4)
-        lims = [min(all_den_true.min(), all_den_pred.min()),
-                max(all_den_true.max(), all_den_pred.max())]
+        ax.scatter(all_fn_true_raw, all_fn_pred_raw, alpha=0.1, s=4)
+        lims = [min(all_fn_true_raw.min(), all_fn_pred_raw.min()),
+                max(all_fn_true_raw.max(), all_fn_pred_raw.max())]
         ax.plot(lims, lims, "k--", lw=0.5)
-        ax.set_xlabel("Actual num_gt")
-        ax.set_ylabel("Predicted num_gt")
-        ax.set_title(f"Num GT (R2={overall_den['r2']:.3f})")
+        ax.set_xlabel("Actual fn (raw)")
+        ax.set_ylabel("Predicted fn (raw)")
+        ax.set_title(f"fn Raw / Denormalized (R2={overall_fn_raw['r2']:.3f})")
 
         ax = axes[1, 1]
-        seq_names_plot = [s for s in VAL_SEQUENCES if s in all_fn_metrics]
+        seq_names_plot = [s for s in VAL_SEQUENCES if s in all_fn_metrics_norm]
         x = np.arange(len(seq_names_plot))
         bw = 0.35
-        fn_r2 = [all_fn_metrics[s]["r2"] for s in seq_names_plot]
-        den_r2 = [all_den_metrics[s]["r2"] for s in seq_names_plot]
-        ax.bar(x - bw/2, fn_r2, bw, label="fn R2", color="steelblue")
-        ax.bar(x + bw/2, den_r2, bw, label="num_gt R2", color="coral")
+        fn_r2_norm = [all_fn_metrics_norm[s]["r2"] for s in seq_names_plot]
+        fn_r2_raw = [all_fn_metrics_raw[s]["r2"] for s in seq_names_plot]
+        ax.bar(x - bw/2, fn_r2_norm, bw, label="fn R2 (norm)", color="steelblue")
+        ax.bar(x + bw/2, fn_r2_raw, bw, label="fn R2 (raw)", color="coral")
         ax.set_xticks(x)
         ax.set_xticklabels(seq_names_plot, rotation=90, ha="center", fontsize=6)
         ax.set_ylabel("R2")
-        ax.set_title("Per-Sequence R2")
+        ax.set_title("Per-Sequence R2 (norm vs raw)")
         ax.legend(fontsize=7)
         ax.axhline(0, color="k", lw=0.5, ls="--")
 
-        fig.suptitle("Page 2: Diagnostics", fontsize=14, fontweight="bold")
+        fig.suptitle("Page 2: Diagnostics (per-seq normalized, horizon=3)",
+                     fontsize=14, fontweight="bold")
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         pdf.savefig(fig, dpi=150)
         plt.close(fig)
@@ -622,26 +681,27 @@ def main():
         ax1.axis("off")
         rows = []
         for seq in VAL_SEQUENCES + ["OVERALL"]:
-            fm = all_fn_metrics.get(seq)
+            fm_n = all_fn_metrics_norm.get(seq)
+            fm_r = all_fn_metrics_raw.get(seq)
             dm = all_den_metrics.get(seq)
-            if fm and dm:
+            if fm_n and fm_r and dm:
                 w_label = seq_weather.get(seq, "")
                 rows.append([
                     seq, w_label,
-                    f"{fm['mae']:.3f}", f"{fm['r2']:.4f}", f"{fm['rho']:.4f}",
-                    f"{dm['mae']:.3f}", f"{dm['r2']:.4f}", f"{dm['rho']:.4f}",
+                    f"{fm_n['mae']:.3f}", f"{fm_n['r2']:.4f}",
+                    f"{fm_r['r2']:.4f}", f"{fm_n['rho']:.4f}",
+                    f"{dm['mae']:.3f}", f"{dm['r2']:.4f}",
                 ])
         rows.append([
             "BASELINE", "(mean)",
-            f"{baseline_fn['mae']:.3f}", f"{baseline_fn['r2']:.4f}",
-            f"{baseline_fn['rho']:.4f}",
+            f"{baseline_fn_norm['mae']:.3f}", f"{baseline_fn_norm['r2']:.4f}",
+            f"{baseline_fn_raw['r2']:.4f}", f"{baseline_fn_norm['rho']:.4f}",
             f"{baseline_den['mae']:.3f}", f"{baseline_den['r2']:.4f}",
-            f"{baseline_den['rho']:.4f}",
         ])
 
         col_labels = ["Sequence", "Weather",
-                       "fn MAE", "fn R2", "fn rho",
-                       "GT MAE", "GT R2", "GT rho"]
+                       "fn MAE", "fn R2(norm)", "fn R2(raw)", "fn rho",
+                       "GT MAE", "GT R2"]
         table = ax1.table(cellText=rows, colLabels=col_labels,
                           loc="center", cellLoc="center")
         table.auto_set_font_size(False)
@@ -652,7 +712,7 @@ def main():
             table[0, j].set_facecolor("#4472C4")
             table[0, j].set_text_props(color="white", fontweight="bold")
 
-        ax1.set_title("Spatial LSTM -- Validation Metrics (15 spatial features, target=fn)",
+        ax1.set_title("Spatial LSTM (per-seq norm, horizon=3) -- Validation Metrics",
                        fontsize=12, fontweight="bold", pad=20)
 
         fig.suptitle("Page 3: Per-Sequence Metrics", fontsize=14, fontweight="bold")
@@ -671,10 +731,16 @@ def main():
                 name, res["target"],
                 f"{res['r2']:.4f}", f"{res['mae']:.4f}", f"{res['rho']:.4f}",
             ])
+        # Current experiment: two rows (normalized = intra-seq, raw = denormalized)
         comp_rows.append([
-            "Spatial (15 feat)", "miss_count (fn)",
-            f"{overall_fn['r2']:.4f}", f"{overall_fn['mae']:.4f}",
-            f"{overall_fn['rho']:.4f}",
+            "Spatial intra-seq (15)", "fn (norm)",
+            f"{overall_fn_norm['r2']:.4f}", f"{overall_fn_norm['mae']:.4f}",
+            f"{overall_fn_norm['rho']:.4f}",
+        ])
+        comp_rows.append([
+            "Spatial raw (15)", "fn (denorm)",
+            f"{overall_fn_raw['r2']:.4f}", f"{overall_fn_raw['mae']:.4f}",
+            f"{overall_fn_raw['rho']:.4f}",
         ])
 
         comp_labels = ["Experiment", "Target", "R2", "MAE", "rho"]
@@ -687,25 +753,26 @@ def main():
         for j in range(len(comp_labels)):
             comp_table[0, j].set_facecolor("#C44472")
             comp_table[0, j].set_text_props(color="white", fontweight="bold")
-        # Highlight last row (spatial)
-        last_row = len(comp_rows)
-        for j in range(len(comp_labels)):
-            comp_table[last_row, j].set_facecolor("#E8F5E9")
+        # Highlight last two rows (current experiment)
+        for row_offset in [len(comp_rows) - 1, len(comp_rows)]:
+            for j in range(len(comp_labels)):
+                comp_table[row_offset, j].set_facecolor("#E8F5E9")
 
         ax1.set_title("Cross-Experiment Comparison (all LSTM experiments on DETRAC)",
                        fontsize=12, fontweight="bold", pad=20)
 
-        # Per-weather R2 bar chart
+        # Per-weather R2 bar chart (normalized = intra-seq)
         weather_cats = ["sunny", "cloudy", "night", "rainy"]
         x = np.arange(len(weather_cats))
         bw = 0.25
         spatial_r2 = [weather_r2.get(w, {}).get("r2", 0) for w in weather_cats]
 
-        ax2.bar(x, spatial_r2, bw, label="Spatial (15 feat, fn)", color="steelblue")
+        ax2.bar(x, spatial_r2, bw, label="Spatial intra-seq (norm)", color="steelblue")
         ax2.set_xticks(x)
         ax2.set_xticklabels(weather_cats, fontsize=10)
         ax2.set_ylabel("R2")
-        ax2.set_title("Per-Weather fn R2", fontsize=11, fontweight="bold")
+        ax2.set_title("Per-Weather fn R2 (normalized = intra-sequence)",
+                       fontsize=11, fontweight="bold")
         ax2.legend(fontsize=9)
         ax2.axhline(0, color="k", lw=0.5, ls="--")
 
