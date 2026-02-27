@@ -1,0 +1,11 @@
+colorfulness
+top_gradient_std
+top_high_freq_energy
+mean_brightness
+keypoint_loss_ratio
+mscn_kurtosis
+saturation_mean
+glcm_energy
+edge_fine_coarse_ratio
+foreground_blob_count
+mscn_skewness
