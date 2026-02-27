@@ -21,3 +21,4 @@ res_experiment/2lstms/*_data.csv
 res_experiment/2lstms/*.pkl
 lstm/lstm_old.py
 lstm/crafted_dataset.csv
+new_features/new_all_features.csv
