@@ -1,20 +1,10 @@
 latest: 
-- models: nano@320, medium@640 
-- target: fn (miss count from nano@320)
-- horizon: 3 frames ahead
-- context window: 20 frames input
-- 15 features:
-strip-based (3 per strip × 3 strips = 9):
-top/mid/bot_laplacian_variance — sharpness
-top/mid/bot_small_component_count — small edge blob count
-top/mid/bot_gradient_magnitude_std — texture variation
-global (6):
-global_total_small_components — scene busyness (best feature)
-global_overall_edge_density — how many edges overall
-global_FAST_keypoint_count — corner/interest points
-global_mean_brightness — lighting
-global_dark_channel_mean — weather/fog proxy
-global_temporal_diff_mean — motion between frames
-- per-sequence R² = 0.17. almost flat.
-- intra-sequence R² = 0.200: 20% of within-sequence variance explained.
-- raw R² = 0.791. misleading.
+- new_analysis_summary.csv — Feature correlation table. All 65 features ranked by how well they predict difficulty on DETRAC. Top: fast_keypoints_half (ρ=0.495).
+
+- new_full_eval_results.pdf — DETRAC main result. LSTM 78.9% vs MedSample 79.0% — tied. Features work but don't beat probing on static cameras.
+
+- new_seed_validation_results.pdf — 80% ceiling proof. 3 architectures × 5 seeds all hit ~80%. No model breaks through — the limit is the features, not the model.
+
+- viss_full_evaluation_results.pdf — VisDrone main result (strongest). GRU 77% vs MedSample 50.4% — +27 point gap. On moving cameras, features crush probing.
+
+- viss_trend_analysis_results.pdf — Negative result. Feature slopes don't predict difficulty. Only 2/113 features where slope beats raw. Intra-sequence transitions remain unsolved.
